@@ -13,7 +13,17 @@ import numpy as np
 import pandas as pd
 from scipy.io import loadmat, whosmat
 
-from models import ChannelSpec, FeatureBlock, LabelInfo, ProcessedSpec, RecordIndex, SignalBlock
+from models import (
+    ChannelSpec,
+    FeatureBlock,
+    ICAEventWindow,
+    ICAScope,
+    ICASourceBlock,
+    LabelInfo,
+    ProcessedSpec,
+    RecordIndex,
+    SignalBlock,
+)
 
 
 DATASET_ROOT = Path(os.environ.get("EEG_DATASET_ROOT", r"E:\BaiduNetdiskDownload\dataset"))
@@ -175,6 +185,40 @@ class DatasetAdapter(ABC):
     def load_processed(self, record_id: str, processed_spec: ProcessedSpec, channel_spec: ChannelSpec) -> SignalBlock | FeatureBlock:
         raise NotImplementedError
 
+    @abstractmethod
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        raise NotImplementedError
+
+
+def _make_raw_array(data: np.ndarray, channel_names: list[str], fs: float) -> mne.io.RawArray:
+    """Create an MNE RawArray from numpy data (channels x samples)."""
+    info = mne.create_info(ch_names=channel_names, sfreq=fs, ch_types="eeg")
+    data_volts = data * 1e-6 if np.abs(data).max() > 1.0 else data
+    return mne.io.RawArray(data_volts, info, verbose="ERROR")
+
+
+def _standardize_montage(inst: mne.io.BaseRaw | mne.BaseEpochs) -> list[str]:
+    """Set standard_1020 montage. Returns list of warning strings."""
+    warnings_out: list[str] = []
+    _1020 = mne.channels.make_standard_montage("standard_1020")
+    valid = {name.lower(): name for name in _1020.ch_names}
+    rename_map: dict[str, str] = {}
+    for ch in inst.ch_names:
+        low = ch.lower()
+        if low in valid and ch != valid[low]:
+            rename_map[ch] = valid[low]
+    if rename_map:
+        inst.rename_channels(rename_map)
+    eeg_picks = mne.pick_types(inst.info, eeg=True)
+    unmatched = [inst.ch_names[i] for i in eeg_picks if inst.ch_names[i].lower() not in valid]
+    if unmatched:
+        warnings_out.append(f"Channels without standard 10-20 coordinates (excluded from montage): {unmatched}")
+    try:
+        inst.set_montage(_1020, on_missing="warn", verbose="ERROR")
+    except Exception:
+        warnings_out.append("Could not set standard_1020 montage; topomap quality may be reduced.")
+    return warnings_out
+
 
 class DEAPAdapter(DatasetAdapter):
     dataset_name = "DEAP"
@@ -316,6 +360,54 @@ class DEAPAdapter(DatasetAdapter):
             source_note="DEAP preprocessed time-domain signals from python .dat.",
         )
 
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        record = self.get_record(record_id)
+        raw_full = self._open_raw(record.source_paths["raw"])
+        fs = float(raw_full.info["sfreq"])
+        warnings_out: list[str] = []
+        all_bounds = self._trial_bounds(record.source_paths["raw"])
+
+        if scope == "event":
+            start, stop = all_bounds[record.event - 1]
+            raw = raw_full.copy().crop(tmin=start / fs, tmax=(stop - 1) / fs)
+            raw.pick(DEAP_EEG_CHANNELS)
+            raw.load_data(verbose="ERROR")
+            warnings_out += _standardize_montage(raw)
+            event_windows = [ICAEventWindow(
+                event=record.event, start_sec=0.0,
+                stop_sec=(stop - start) / fs, label_summary=record.label_summary,
+            )]
+            return ICASourceBlock(
+                inst=raw, scope="event", fs=fs,
+                duration_sec=(stop - start) / fs,
+                channel_names=list(DEAP_EEG_CHANNELS),
+                event_windows=event_windows,
+                label_info=self.get_label(record_id),
+                source_note="DEAP event-level BDF segment (EEG only).",
+                warnings=warnings_out,
+            )
+        else:
+            raw = raw_full.copy()
+            raw.pick(DEAP_EEG_CHANNELS)
+            raw.load_data(verbose="ERROR")
+            warnings_out += _standardize_montage(raw)
+            event_windows = []
+            for idx, (s, e) in enumerate(all_bounds, 1):
+                rec = self.records.get(_make_record_id(self.dataset_name, record.subject, record.session, idx))
+                event_windows.append(ICAEventWindow(
+                    event=idx, start_sec=s / fs, stop_sec=e / fs,
+                    label_summary=rec.label_summary if rec else "",
+                ))
+            return ICASourceBlock(
+                inst=raw, scope="session", fs=fs,
+                duration_sec=raw.times[-1],
+                channel_names=list(DEAP_EEG_CHANNELS),
+                event_windows=event_windows,
+                label_info=self.get_label(record_id),
+                source_note="DEAP session-level full BDF (EEG only).",
+                warnings=warnings_out,
+            )
+
 
 class SEEDAdapter(DatasetAdapter):
     dataset_name = "SEED"
@@ -423,6 +515,64 @@ class SEEDAdapter(DatasetAdapter):
             source_note="SEED feature tensor from ExtractedFeatures.",
         )
 
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        record = self.get_record(record_id)
+        fs = 200.0
+        ch_names = list(record.channel_names)
+        warnings_out: list[str] = []
+
+        if scope == "event":
+            var_name = record.source_paths["raw_var"]
+            data = np.asarray(self._load_preprocessed(record.source_paths["raw"], var_name))
+            raw = _make_raw_array(data, ch_names, fs)
+            warnings_out += _standardize_montage(raw)
+            return ICASourceBlock(
+                inst=raw, scope="event", fs=fs,
+                duration_sec=data.shape[1] / fs,
+                channel_names=ch_names,
+                event_windows=[ICAEventWindow(
+                    event=record.event, start_sec=0.0,
+                    stop_sec=data.shape[1] / fs, label_summary=record.label_summary,
+                )],
+                label_info=self.get_label(record_id),
+                source_note="SEED event-level preprocessed EEG as RawArray.",
+                warnings=warnings_out,
+            )
+        else:
+            session_records = sorted(
+                [r for r in self.records.values() if r.session == record.session],
+                key=lambda r: r.event,
+            )
+            trials = []
+            event_windows = []
+            for rec in session_records:
+                var_name = rec.source_paths["raw_var"]
+                trial_data = np.asarray(self._load_preprocessed(rec.source_paths["raw"], var_name))
+                trials.append(trial_data)
+                event_windows.append(ICAEventWindow(
+                    event=rec.event, start_sec=0.0,
+                    stop_sec=trial_data.shape[1] / fs,
+                    epoch_index=len(trials) - 1,
+                    label_summary=rec.label_summary,
+                ))
+            max_len = max(t.shape[1] for t in trials)
+            padded = np.zeros((len(trials), len(ch_names), max_len))
+            for i, t in enumerate(trials):
+                padded[i, :, : t.shape[1]] = t
+            padded_volts = padded * 1e-6 if np.abs(padded).max() > 1.0 else padded
+            info = mne.create_info(ch_names=ch_names, sfreq=fs, ch_types="eeg")
+            epochs = mne.EpochsArray(padded_volts, info, verbose="ERROR")
+            warnings_out += _standardize_montage(epochs)
+            return ICASourceBlock(
+                inst=epochs, scope="session", fs=fs,
+                duration_sec=sum(t.shape[1] for t in trials) / fs,
+                channel_names=ch_names,
+                event_windows=event_windows,
+                label_info=self.get_label(record_id),
+                source_note=f"SEED session {record.session}: {len(trials)} trials as EpochsArray.",
+                warnings=warnings_out,
+            )
+
 
 class SEEDIVAdapter(DatasetAdapter):
     dataset_name = "SEED-IV"
@@ -527,6 +677,65 @@ class SEEDIVAdapter(DatasetAdapter):
             label_info=self.get_label(record_id),
             source_note="SEED-IV smoothed EEG features.",
         )
+
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        record = self.get_record(record_id)
+        fs = 200.0
+        ch_names = list(record.channel_names)
+        warnings_out: list[str] = []
+
+        if scope == "event":
+            var_name = record.source_paths["raw_var"]
+            data = np.asarray(self._load_raw_trial(record.source_paths["raw"], var_name))
+            raw = _make_raw_array(data, ch_names, fs)
+            warnings_out += _standardize_montage(raw)
+            return ICASourceBlock(
+                inst=raw, scope="event", fs=fs,
+                duration_sec=data.shape[1] / fs,
+                channel_names=ch_names,
+                event_windows=[ICAEventWindow(
+                    event=record.event, start_sec=0.0,
+                    stop_sec=data.shape[1] / fs, label_summary=record.label_summary,
+                )],
+                label_info=self.get_label(record_id),
+                source_note="SEED-IV event-level raw trial as RawArray.",
+                warnings=warnings_out,
+            )
+        else:
+            session_records = sorted(
+                [r for r in self.records.values()
+                 if r.session == record.session and r.subject == record.subject],
+                key=lambda r: r.event,
+            )
+            trials = []
+            event_windows = []
+            for rec in session_records:
+                var_name = rec.source_paths["raw_var"]
+                trial_data = np.asarray(self._load_raw_trial(rec.source_paths["raw"], var_name))
+                trials.append(trial_data)
+                event_windows.append(ICAEventWindow(
+                    event=rec.event, start_sec=0.0,
+                    stop_sec=trial_data.shape[1] / fs,
+                    epoch_index=len(trials) - 1,
+                    label_summary=rec.label_summary,
+                ))
+            max_len = max(t.shape[1] for t in trials)
+            padded = np.zeros((len(trials), len(ch_names), max_len))
+            for i, t in enumerate(trials):
+                padded[i, :, : t.shape[1]] = t
+            padded_volts = padded * 1e-6 if np.abs(padded).max() > 1.0 else padded
+            info = mne.create_info(ch_names=ch_names, sfreq=fs, ch_types="eeg")
+            epochs = mne.EpochsArray(padded_volts, info, verbose="ERROR")
+            warnings_out += _standardize_montage(epochs)
+            return ICASourceBlock(
+                inst=epochs, scope="session", fs=fs,
+                duration_sec=sum(t.shape[1] for t in trials) / fs,
+                channel_names=ch_names,
+                event_windows=event_windows,
+                label_info=self.get_label(record_id),
+                source_note=f"SEED-IV session {record.session}: {len(trials)} trials as EpochsArray.",
+                warnings=warnings_out,
+            )
 
 
 class SEEDVIGAdapter(DatasetAdapter):
@@ -651,6 +860,53 @@ class SEEDVIGAdapter(DatasetAdapter):
             label_info=self.get_label(record_id),
             source_note=f"SEED-VIG {band_key} feature window.",
         )
+
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        record = self.get_record(record_id)
+        warnings_out: list[str] = []
+
+        if scope == "event":
+            data_time_first, ch_names, fs = self._load_raw_file(record.source_paths["raw"])
+            start = int((record.event - 1) * fs * 8)
+            stop = int(record.event * fs * 8)
+            data = data_time_first[start:stop, :].T
+            raw = _make_raw_array(data, ch_names, fs)
+            warnings_out += _standardize_montage(raw)
+            return ICASourceBlock(
+                inst=raw, scope="event", fs=fs,
+                duration_sec=data.shape[1] / fs,
+                channel_names=ch_names,
+                event_windows=[ICAEventWindow(
+                    event=record.event, start_sec=0.0,
+                    stop_sec=data.shape[1] / fs, label_summary=record.label_summary,
+                )],
+                label_info=self.get_label(record_id),
+                source_note="SEED-VIG event-level 8s raw EEG segment.",
+                warnings=warnings_out,
+            )
+        else:
+            data_time_first, ch_names, fs = self._load_raw_file(record.source_paths["raw"])
+            data = data_time_first.T
+            raw = _make_raw_array(data, ch_names, fs)
+            warnings_out += _standardize_montage(raw)
+            perclos = self._load_perclos(record.source_paths["label"])
+            event_windows = []
+            for ev in range(1, len(perclos) + 1):
+                event_windows.append(ICAEventWindow(
+                    event=ev,
+                    start_sec=(ev - 1) * 8.0,
+                    stop_sec=ev * 8.0,
+                    label_summary=f"perclos={perclos[ev - 1]:.3f}",
+                ))
+            return ICASourceBlock(
+                inst=raw, scope="session", fs=fs,
+                duration_sec=data.shape[1] / fs,
+                channel_names=ch_names,
+                event_windows=event_windows,
+                label_info=self.get_label(record_id),
+                source_note="SEED-VIG session-level full continuous EEG.",
+                warnings=warnings_out,
+            )
 
 
 class SEEDVIIAdapter(DatasetAdapter):
@@ -834,6 +1090,60 @@ class SEEDVIIAdapter(DatasetAdapter):
             source_note="SEED-VII preprocessed EEG segment.",
         )
 
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        record = self.get_record(record_id)
+        raw_full = self._open_cnt(record.source_paths["raw"])
+        fs = float(raw_full.info["sfreq"])
+        eeg_picks = [name for name in raw_full.ch_names if name not in {"M1", "M2", "ECG", "HEO", "VEO"}]
+        warnings_out: list[str] = []
+
+        if scope == "event":
+            within_session = (record.event - 1) % 20
+            start, stop = self._csv_segments(record.source_paths["raw"], str(self.save_info_dir))[within_session]
+            raw = raw_full.copy().crop(tmin=start / fs, tmax=(stop - 1) / fs)
+            raw.pick(eeg_picks, verbose="ERROR")
+            raw.load_data(verbose="ERROR")
+            warnings_out += _standardize_montage(raw)
+            return ICASourceBlock(
+                inst=raw, scope="event", fs=fs,
+                duration_sec=(stop - start) / fs,
+                channel_names=list(record.channel_names),
+                event_windows=[ICAEventWindow(
+                    event=record.event, start_sec=0.0,
+                    stop_sec=(stop - start) / fs, label_summary=record.label_summary,
+                )],
+                label_info=self.get_label(record_id),
+                source_note="SEED-VII event-level CNT segment (EEG only).",
+                warnings=warnings_out,
+            )
+        else:
+            raw = raw_full.copy()
+            raw.pick(eeg_picks, verbose="ERROR")
+            raw.load_data(verbose="ERROR")
+            warnings_out += _standardize_montage(raw)
+            all_segments = self._csv_segments(record.source_paths["raw"], str(self.save_info_dir))
+            session_int = int(record.session)
+            event_offset = (session_int - 1) * 20
+            event_windows = []
+            for idx, (s, e) in enumerate(all_segments):
+                ev_num = event_offset + idx + 1
+                rec = self.records.get(
+                    _make_record_id(self.dataset_name, record.subject, record.session, ev_num)
+                )
+                event_windows.append(ICAEventWindow(
+                    event=ev_num, start_sec=s / fs, stop_sec=e / fs,
+                    label_summary=rec.label_summary if rec else "",
+                ))
+            return ICASourceBlock(
+                inst=raw, scope="session", fs=fs,
+                duration_sec=raw.times[-1],
+                channel_names=list(record.channel_names),
+                event_windows=event_windows,
+                label_info=self.get_label(record_id),
+                source_note="SEED-VII session-level full CNT (EEG only).",
+                warnings=warnings_out,
+            )
+
 
 class DatasetRegistry:
     def __init__(self, root: Path = DEFAULT_ROOT) -> None:
@@ -872,6 +1182,9 @@ class DatasetRegistry:
 
     def load_processed(self, record_id: str, processed_spec: ProcessedSpec, channel_spec: ChannelSpec) -> SignalBlock | FeatureBlock:
         return self.get_adapter(record_id).load_processed(record_id, processed_spec, channel_spec)
+
+    def load_ica_source(self, record_id: str, scope: ICAScope, channel_spec: ChannelSpec) -> ICASourceBlock:
+        return self.get_adapter(record_id).load_ica_source(record_id, scope, channel_spec)
 
     def get_band_options(self, record_id: str, processed_key: str) -> list[str]:
         return self.get_adapter(record_id).get_band_options(record_id, processed_key)

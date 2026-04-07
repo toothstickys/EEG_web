@@ -10,6 +10,7 @@
 - 在线预设：`de_movingAve / de_LDS / psd_movingAve / psd_LDS`
 - 导出当前事件 raw CSV
 - 按筛选结果批量导出 ZIP
+- **ICA / ICLabel 分析页面** (`/ica`)
 
 ## 1. 环境要求
 
@@ -27,7 +28,12 @@ mne==1.11.0
 dash==4.1.0
 plotly==6.6.0
 openpyxl==3.1.5
+mne-icalabel>=0.7
+scikit-learn>=1.3
+onnxruntime>=1.16
 ```
+
+> **ICA 依赖说明**：`mne-icalabel` 需要 `scikit-learn`（用于 extended infomax ICA）和 `onnxruntime`（用于 ICLabel 推理）。如果环境里已有 `torch`，`mne-icalabel` 也可以使用它作为后端。
 
 安装：
 
@@ -273,8 +279,86 @@ pip install openpyxl
 ## 9. 主要文件
 
 - [app.py](f:/EEG_web/app.py)
-  - Web UI、图像、线上处理、导出
+  - Web UI、图像、线上处理、导出、ICA 页面
 - [dataset_adapters.py](f:/EEG_web/dataset_adapters.py)
-  - 五个数据集的扫描、加载和标签映射
+  - 五个数据集的扫描、加载、标签映射和 ICA 数据源装配
 - [models.py](f:/EEG_web/models.py)
-  - 数据结构定义
+  - 数据结构定义（含 ICA 相关类型）
+- [ica_pipeline.py](f:/EEG_web/ica_pipeline.py)
+  - ICA 预处理、拟合、ICLabel 分类、图像生成、缓存
+
+## 10. ICA / ICLabel 页面
+
+### 入口
+
+在主页面点击 **ICA View** 按钮，会自动跳转到 `/ica` 页面，并带上当前选定的 record、dataset、subject、session 上下文。
+
+### 使用方法
+
+1. 选择 **Scope**：
+   - `Current Event`：只用当前事件的 EEG 做 ICA
+   - `Current Session / File`：用整个 session 或文件的 EEG 做 ICA
+2. 调整 **Reject Threshold**（默认 0.80）
+3. 点击 **Run ICA**
+4. 查看结果：
+   - 摘要卡片：scope、采样率、通道数、IC 数量、建议剔除数
+   - 组件表：IC 序号、分类标签、各类概率、建议剔除标记
+   - 点击表格行查看组件详情（topomap、概率条形图、激活时序、PSD）
+   - 清理前后对比图（原始 EEG vs 剔除 IC 后的 EEG）
+
+### Session vs Event 差异
+
+| 数据集 | Event 范围 | Session 范围 |
+|--------|-----------|-------------|
+| DEAP | 单 trial BDF 片段 (30 EEG ch) | 整段 `.bdf` EEG |
+| SEED | 单 `*_eeg{N}` trial | 当前 session 15 个 trial → `EpochsArray` |
+| SEED-IV | 单 trial raw | 当前 session 24 个 trial → `EpochsArray` |
+| SEED-VIG | 8s 原始片段 | 整段 `EEG.data` 连续记录 |
+| SEED-VII | CNT 事件片段 | 当前 subject-session 整段 `.cnt` EEG |
+
+### ICLabel 预处理假设
+
+按官方 `mne-icalabel` 示例固定：
+
+- 平均参考 (common average reference)
+- 带通 1 Hz – min(100 Hz, Nyquist - 1 Hz)
+- 采样率 > 200 Hz 时重采样到 200 Hz
+- `ICA(method="infomax", fit_params={"extended": True}, random_state=97, max_iter="auto")`
+- Session 范围额外使用 `decim=2`
+
+ICLabel 输出 7 类：`brain`、`muscle artifact`、`eye blink`、`heart beat`、`line noise`、`channel noise`、`other`。
+
+默认建议剔除：类别不是 `brain` / `other` 且最大概率 ≥ 阈值（默认 0.80）。
+
+### 限制与注意
+
+- ICA 只使用 EEG 通道；DEAP 的外围生理通道和 SEED-VII 的 M1/M2/ECG/HEO/VEO 不进入 ICA
+- 短片段 (<30s) 或少通道 (<8) 时会显示低置信度警告
+- ICA 计算可能耗时较长（session 级别可达 30-120 秒），请耐心等待
+
+## 11. 常见问题补充
+
+### 5) 页面报 callback 错误或显示异常
+
+这通常是"回调 schema 失配"：浏览器端缓存了旧的回调依赖图，但服务端已经更新。
+
+**自动处理**：页面内置了 schema 版本检查，检测到失配时会自动强制刷新。
+
+**手动处理**：
+1. 停止服务器 (`Ctrl+C`)
+2. 重启 `python app.py`
+3. 在浏览器中按 `Ctrl+Shift+R` 强制硬刷新
+
+### 6) ICA 页面报依赖错误
+
+确认已安装 ICA 相关依赖：
+
+```powershell
+pip install mne-icalabel scikit-learn onnxruntime
+```
+
+或者直接：
+
+```powershell
+pip install -r requirements.txt
+```

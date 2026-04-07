@@ -8,14 +8,15 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy import signal
-from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update
+from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update, callback_context, clientside_callback
 from plotly.subplots import make_subplots
 
 from dataset_adapters import DATASET_ROOT, DatasetRegistry
-from models import ChannelSpec, FeatureBlock, ProcessedSpec, SignalBlock
+from models import ChannelSpec, FeatureBlock, ICAEventWindow, ProcessedSpec, SignalBlock
 
 
 APP_TITLE = "EEG Raw / Processed Comparator"
+APP_SCHEMA_VERSION = "2"
 REGISTRY = DatasetRegistry(DATASET_ROOT)
 DEFAULT_DATASET = REGISTRY.dataset_names()[0]
 ACCENT = "#d44b2f"
@@ -167,8 +168,14 @@ body {
 }
 """
 
-app = Dash(__name__, title=APP_TITLE)
+app = Dash(__name__, title=APP_TITLE, suppress_callback_exceptions=True)
 server = app.server
+
+
+@server.route("/api/schema-version")
+def _schema_version():
+    import json
+    return json.dumps({"version": APP_SCHEMA_VERSION}), 200, {"Content-Type": "application/json"}
 app.index_string = f"""<!DOCTYPE html>
 <html>
     <head>
@@ -185,6 +192,25 @@ app.index_string = f"""<!DOCTYPE html>
             {{%scripts%}}
             {{%renderer%}}
         </footer>
+        <script>
+        (function(){{
+            var _schemaVersion = "{APP_SCHEMA_VERSION}";
+            var _origFetch = window.fetch;
+            window.fetch = function(url, opts) {{
+                return _origFetch.apply(this, arguments).then(function(resp) {{
+                    if (typeof url === 'string' && url.indexOf('_dash-update-component') !== -1 && resp.status >= 400) {{
+                        _origFetch('/api/schema-version').then(function(r){{return r.json()}}).then(function(d){{
+                            if(d.version !== _schemaVersion) {{
+                                console.warn('Callback schema mismatch, reloading...');
+                                location.reload(true);
+                            }}
+                        }}).catch(function(){{}});
+                    }}
+                    return resp;
+                }});
+            }};
+        }})();
+        </script>
     </body>
 </html>"""
 
@@ -805,6 +831,7 @@ def filter_panel() -> html.Div:
                 [
                     html.Button("Export Current Raw CSV", id="export-current-btn", n_clicks=0, className="action-btn"),
                     html.Button("Export Filtered ZIP", id="export-batch-btn", n_clicks=0, className="action-btn secondary"),
+                    html.Button("ICA View", id="ica-view-btn", n_clicks=0, className="action-btn", style={"background": "#3a6b8c"}),
                 ],
                 className="button-stack",
             ),
@@ -815,94 +842,304 @@ def filter_panel() -> html.Div:
     )
 
 
+def main_page_layout() -> html.Div:
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("EEG Raw / Processed Comparator", className="title"),
+                    html.Div(
+                        f"Source: {DATASET_ROOT} | startup index records: {len(REGISTRY.records)} | schema v{APP_SCHEMA_VERSION}",
+                        className="subtitle",
+                    ),
+                ],
+                className="hero",
+            ),
+            filter_panel(),
+            html.Div(id="summary-text", className="summary-bar"),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Indexed Records", className="section-title"),
+                            dash_table.DataTable(
+                                id="record-table",
+                                columns=[
+                                    {"name": "Event", "id": "event"},
+                                    {"name": "Raw", "id": "raw_shape"},
+                                    {"name": "Processed", "id": "processed_shape"},
+                                    {"name": "Raw Hz", "id": "raw_fs"},
+                                    {"name": "Proc Hz", "id": "processed_fs"},
+                                    {"name": "Label", "id": "label_summary"},
+                                    {"name": "record_id", "id": "record_id", "hidden": True},
+                                ],
+                                data=[],
+                                sort_action="native",
+                                page_size=14,
+                                style_table={"overflowX": "auto"},
+                                style_header={"backgroundColor": "#f7e6d9", "fontWeight": 700},
+                                style_cell={
+                                    "backgroundColor": PANEL,
+                                    "border": f"1px solid {BORDER}",
+                                    "color": INK,
+                                    "fontFamily": "IBM Plex Sans, Segoe UI, sans-serif",
+                                    "fontSize": "13px",
+                                    "padding": "8px",
+                                    "textAlign": "left",
+                                },
+                            ),
+                        ],
+                        className="left-column",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(id="label-badge"),
+                            dcc.Graph(id="raw-graph"),
+                            dcc.Graph(id="processed-graph"),
+                        ],
+                        className="right-column",
+                    ),
+                ],
+                className="content-grid",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Raw Preview", className="section-title"),
+                            html.Div(id="raw-meta", className="meta-text"),
+                            html.Pre(id="raw-preview", className="preview"),
+                        ],
+                        className="preview-panel",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Processed Preview", className="section-title"),
+                            html.Div(id="processed-meta", className="meta-text"),
+                            html.Pre(id="processed-preview", className="preview"),
+                        ],
+                        className="preview-panel",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Notes", className="section-title"),
+                            html.Div(id="notes-panel", className="notes-text"),
+                        ],
+                        className="preview-panel",
+                    ),
+                ],
+                className="bottom-grid",
+            ),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# ICA Page Layout
+# ---------------------------------------------------------------------------
+
+ICA_CSS = """
+.ica-page { padding: 28px; }
+.ica-header { display: flex; align-items: center; gap: 18px; margin-bottom: 18px; }
+.ica-back { color: #3a6b8c; text-decoration: none; font-weight: 700; cursor: pointer; }
+.ica-controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-bottom: 18px; }
+.ica-summary { padding: 16px; background: #fff8f1; border: 1px solid #e2c9b5; border-radius: 14px; margin-bottom: 18px; }
+.ica-warnings { color: #b45309; font-size: 13px; margin-bottom: 14px; }
+.ica-component-table { margin-bottom: 18px; }
+.ica-detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 18px; }
+.ica-compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.ica-card { background: #fff8f1; border: 1px solid #e2c9b5; border-radius: 14px; padding: 16px; box-shadow: 0 10px 24px rgba(131,91,61,0.08); }
+@media (max-width: 900px) { .ica-detail-grid, .ica-compare-grid { grid-template-columns: 1fr; } }
+"""
+
+
+def ica_page_layout() -> html.Div:
+    return html.Div(
+        [
+            html.Style(ICA_CSS),
+            html.Div(
+                [
+                    html.A("← Back to Main", id="ica-back-link", href="/", className="ica-back"),
+                    html.Div("ICA / ICLabel Analysis", className="title"),
+                ],
+                className="ica-header",
+            ),
+            html.Div(id="ica-context-bar", className="summary-bar", style={"marginBottom": "18px"}),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Scope", className="mini-label"),
+                            dcc.Dropdown(
+                                id="ica-scope-dropdown",
+                                options=[
+                                    {"label": "Current Event", "value": "event"},
+                                    {"label": "Current Session / File", "value": "session"},
+                                ],
+                                value="event",
+                                clearable=False,
+                            ),
+                        ],
+                        className="control-block",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Reject Threshold", className="mini-label"),
+                            dcc.Slider(
+                                id="ica-threshold-slider",
+                                min=0.5, max=1.0, step=0.05, value=0.80,
+                                marks={v: f"{v:.2f}" for v in [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]},
+                                tooltip={"placement": "bottom", "always_visible": True},
+                            ),
+                        ],
+                        className="control-block", style={"gridColumn": "span 2"},
+                    ),
+                    html.Div(
+                        [
+                            html.Button("Run ICA", id="ica-run-btn", n_clicks=0, className="action-btn"),
+                        ],
+                        className="control-block",
+                    ),
+                ],
+                className="ica-controls",
+            ),
+            dcc.Loading(
+                id="ica-loading",
+                type="default",
+                children=[
+                    html.Div(id="ica-warnings", className="ica-warnings"),
+                    html.Div(id="ica-summary", className="ica-summary", style={"display": "none"}),
+                    html.Div(
+                        [
+                            html.Div("Components", className="section-title"),
+                            dash_table.DataTable(
+                                id="ica-component-table",
+                                columns=[
+                                    {"name": "IC#", "id": "index", "type": "numeric"},
+                                    {"name": "Label", "id": "label"},
+                                    {"name": "Max Prob", "id": "max_prob", "type": "numeric"},
+                                    {"name": "Brain", "id": "brain", "type": "numeric"},
+                                    {"name": "Muscle", "id": "muscle artifact", "type": "numeric"},
+                                    {"name": "Eye", "id": "eye blink", "type": "numeric"},
+                                    {"name": "Heart", "id": "heart beat", "type": "numeric"},
+                                    {"name": "Line", "id": "line noise", "type": "numeric"},
+                                    {"name": "Ch Noise", "id": "channel noise", "type": "numeric"},
+                                    {"name": "Other", "id": "other", "type": "numeric"},
+                                    {"name": "Reject", "id": "reject", "presentation": "markdown"},
+                                ],
+                                data=[],
+                                row_selectable="single",
+                                sort_action="native",
+                                page_size=20,
+                                style_table={"overflowX": "auto"},
+                                style_header={"backgroundColor": "#e4f0f7", "fontWeight": 700},
+                                style_cell={
+                                    "backgroundColor": PANEL,
+                                    "border": f"1px solid {BORDER}",
+                                    "color": INK,
+                                    "fontFamily": "IBM Plex Sans, Segoe UI, sans-serif",
+                                    "fontSize": "13px",
+                                    "padding": "8px",
+                                    "textAlign": "center",
+                                },
+                                style_data_conditional=[
+                                    {"if": {"filter_query": '{reject} = "**YES**"'}, "backgroundColor": "#fff0f0"},
+                                ],
+                            ),
+                        ],
+                        className="ica-component-table",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Component Detail", className="section-title"),
+                                    html.Div(id="ica-detail-topomap"),
+                                    dcc.Graph(id="ica-detail-probs", style={"height": "250px"}),
+                                ],
+                                className="ica-card",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Component Activation & PSD", className="section-title"),
+                                    dcc.Graph(id="ica-detail-activation", style={"height": "200px"}),
+                                    html.Div(id="ica-detail-psd"),
+                                ],
+                                className="ica-card",
+                            ),
+                        ],
+                        className="ica-detail-grid",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Original EEG", className="section-title"),
+                                    dcc.Graph(id="ica-source-graph"),
+                                ],
+                                className="ica-card",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Clean EEG (after ICA)", className="section-title"),
+                                    dcc.Graph(id="ica-cleaned-graph"),
+                                ],
+                                className="ica-card",
+                            ),
+                        ],
+                        className="ica-compare-grid",
+                    ),
+                ],
+            ),
+            dcc.Store(id="ica-result-store"),
+        ],
+        className="ica-page",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Top-level routed layout
+# ---------------------------------------------------------------------------
+
 app.layout = html.Div(
     [
-        html.Div(
-            [
-                html.Div("EEG Raw / Processed Comparator", className="title"),
-                html.Div(
-                    f"Source: {DATASET_ROOT} | startup index records: {len(REGISTRY.records)}",
-                    className="subtitle",
-                ),
-            ],
-            className="hero",
-        ),
-        filter_panel(),
-        html.Div(id="summary-text", className="summary-bar"),
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.Div("Indexed Records", className="section-title"),
-                        dash_table.DataTable(
-                            id="record-table",
-                            columns=[
-                                {"name": "Event", "id": "event"},
-                                {"name": "Raw", "id": "raw_shape"},
-                                {"name": "Processed", "id": "processed_shape"},
-                                {"name": "Raw Hz", "id": "raw_fs"},
-                                {"name": "Proc Hz", "id": "processed_fs"},
-                                {"name": "Label", "id": "label_summary"},
-                                {"name": "record_id", "id": "record_id", "hidden": True},
-                            ],
-                            data=[],
-                            sort_action="native",
-                            page_size=14,
-                            style_table={"overflowX": "auto"},
-                            style_header={"backgroundColor": "#f7e6d9", "fontWeight": 700},
-                            style_cell={
-                                "backgroundColor": PANEL,
-                                "border": f"1px solid {BORDER}",
-                                "color": INK,
-                                "fontFamily": "IBM Plex Sans, Segoe UI, sans-serif",
-                                "fontSize": "13px",
-                                "padding": "8px",
-                                "textAlign": "left",
-                            },
-                        ),
-                    ],
-                    className="left-column",
-                ),
-                html.Div(
-                    [
-                        html.Div(id="label-badge"),
-                        dcc.Graph(id="raw-graph"),
-                        dcc.Graph(id="processed-graph"),
-                    ],
-                    className="right-column",
-                ),
-            ],
-            className="content-grid",
-        ),
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.Div("Raw Preview", className="section-title"),
-                        html.Div(id="raw-meta", className="meta-text"),
-                        html.Pre(id="raw-preview", className="preview"),
-                    ],
-                    className="preview-panel",
-                ),
-                html.Div(
-                    [
-                        html.Div("Processed Preview", className="section-title"),
-                        html.Div(id="processed-meta", className="meta-text"),
-                        html.Pre(id="processed-preview", className="preview"),
-                    ],
-                    className="preview-panel",
-                ),
-                html.Div(
-                    [
-                        html.Div("Notes", className="section-title"),
-                        html.Div(id="notes-panel", className="notes-text"),
-                    ],
-                    className="preview-panel",
-                ),
-            ],
-            className="bottom-grid",
-        ),
+        dcc.Location(id="url", refresh=False),
+        dcc.Store(id="shared-state", storage_type="session"),
+        html.Div(id="page-content"),
     ]
+)
+
+
+@app.callback(
+    Output("page-content", "children"),
+    Input("url", "pathname"),
+)
+def route_page(pathname: str | None):
+    if pathname == "/ica":
+        return ica_page_layout()
+    return main_page_layout()
+
+
+# ---------------------------------------------------------------------------
+# ICA View navigation (main page -> /ica)
+# ---------------------------------------------------------------------------
+
+clientside_callback(
+    """
+    function(n_clicks, record_id, dataset, subject, session) {
+        if (!n_clicks || !record_id) return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+        var state = {record_id: record_id, dataset: dataset, subject: subject, session: session};
+        return [state, '/ica'];
+    }
+    """,
+    Output("shared-state", "data"),
+    Output("url", "pathname"),
+    Input("ica-view-btn", "n_clicks"),
+    State("record-dropdown", "value"),
+    State("dataset-dropdown", "value"),
+    State("subject-dropdown", "value"),
+    State("session-dropdown", "value"),
+    prevent_initial_call=True,
 )
 
 
@@ -1185,6 +1422,189 @@ def export_batch(
     record_ids = [str(row["record_id"]) for row in table_data if row.get("record_id")]
     filename = f"{dataset}_{subject or 'all'}_{session or 'all'}_raw_export.zip"
     return dcc.send_bytes(zip_bytes_for_records(record_ids, channel_spec), filename)
+
+
+# ---------------------------------------------------------------------------
+# ICA Page Callbacks
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("ica-context-bar", "children"),
+    Input("shared-state", "data"),
+)
+def ica_update_context(shared: dict | None):
+    if not shared:
+        return "No record selected — go back to the main page and click ICA View."
+    return (
+        f"{shared.get('dataset', '?')} | subject={shared.get('subject', '?')} | "
+        f"session={shared.get('session', '?')} | record={shared.get('record_id', '?')}"
+    )
+
+
+@app.callback(
+    Output("ica-summary", "children"),
+    Output("ica-summary", "style"),
+    Output("ica-component-table", "data"),
+    Output("ica-warnings", "children"),
+    Output("ica-source-graph", "figure"),
+    Output("ica-cleaned-graph", "figure"),
+    Output("ica-result-store", "data"),
+    Input("ica-run-btn", "n_clicks"),
+    State("shared-state", "data"),
+    State("ica-scope-dropdown", "value"),
+    State("ica-threshold-slider", "value"),
+    prevent_initial_call=True,
+)
+def ica_run(n_clicks, shared, scope, threshold):
+    from ica_pipeline import run_ica_pipeline
+    empty_fig = go.Figure()
+    empty_fig.update_layout(template="plotly_white", height=350)
+    if not n_clicks or not shared or not shared.get("record_id"):
+        return "", {"display": "none"}, [], "", empty_fig, empty_fig, None
+
+    record_id = shared["record_id"]
+    channel_spec = ChannelSpec.from_ui(None, None, None, include_aux=False)
+
+    try:
+        source = REGISTRY.load_ica_source(record_id, scope, channel_spec)
+    except Exception as exc:
+        return "", {"display": "none"}, [], f"Error loading ICA source: {exc}", empty_fig, empty_fig, None
+
+    record = REGISTRY.get_record(record_id)
+    current_ew = None
+    for ew in source.event_windows:
+        if ew.event == record.event:
+            current_ew = ew
+            break
+
+    try:
+        result = run_ica_pipeline(
+            source, record_id,
+            reject_threshold=threshold,
+            current_event_window=current_ew,
+        )
+    except Exception as exc:
+        return "", {"display": "none"}, [], f"Error running ICA: {exc}", empty_fig, empty_fig, None
+
+    # Summary
+    n_reject = len(result.excluded_indices)
+    summary_children = [
+        html.Div(f"Scope: {result.scope} | Fit fs: {result.fit_fs:.0f} Hz"),
+        html.Div(f"EEG channels: {len(source.channel_names)} | ICs: {len(result.components)} | Suggested reject: {n_reject}"),
+        html.Div(f"Duration: {source.duration_sec:.1f}s"),
+    ]
+
+    # Component table
+    table_data = []
+    for comp in result.components:
+        row = {
+            "index": comp.index,
+            "label": comp.label,
+            "max_prob": f"{max(comp.probabilities.values()):.3f}",
+            "reject": "**YES**" if comp.suggested_reject else "",
+        }
+        for cls_name in ["brain", "muscle artifact", "eye blink", "heart beat", "line noise", "channel noise", "other"]:
+            row[cls_name] = f"{comp.probabilities.get(cls_name, 0.0):.3f}"
+        table_data.append(row)
+
+    # Warnings
+    warning_children = [html.Div(w) for w in result.notes]
+
+    # Comparison graphs
+    source_fig = build_signal_figure(result.source_preview, "Original EEG (preview window)")
+    cleaned_fig = build_signal_figure(result.cleaned_preview, "Cleaned EEG (after ICA exclusion)")
+    source_fig.update_layout(height=350)
+    cleaned_fig.update_layout(height=350)
+
+    store_data = {
+        "record_id": record_id,
+        "scope": scope,
+        "n_components": len(result.components),
+        "excluded": result.excluded_indices,
+    }
+
+    return (
+        summary_children,
+        {"display": "block"},
+        table_data,
+        warning_children,
+        source_fig,
+        cleaned_fig,
+        store_data,
+    )
+
+
+@app.callback(
+    Output("ica-detail-topomap", "children"),
+    Output("ica-detail-probs", "figure"),
+    Output("ica-detail-activation", "figure"),
+    Output("ica-detail-psd", "children"),
+    Input("ica-component-table", "selected_rows"),
+    State("ica-component-table", "data"),
+    State("ica-result-store", "data"),
+    prevent_initial_call=True,
+)
+def ica_component_detail(selected_rows, table_data, result_store):
+    from ica_pipeline import generate_topomap_base64, generate_component_psd_base64, generate_activation_data
+    empty_fig = go.Figure()
+    empty_fig.update_layout(template="plotly_white", height=200)
+    if not selected_rows or not table_data or not result_store:
+        return "", empty_fig, empty_fig, ""
+
+    row_idx = selected_rows[0]
+    if row_idx >= len(table_data):
+        return "", empty_fig, empty_fig, ""
+    comp_idx = int(table_data[row_idx]["index"])
+    record_id = result_store["record_id"]
+    scope = result_store["scope"]
+
+    # Topomap
+    topo_b64 = generate_topomap_base64(record_id, scope, comp_idx)
+    if topo_b64:
+        topo_el = html.Img(src=f"data:image/png;base64,{topo_b64}", style={"maxWidth": "280px", "borderRadius": "8px"})
+    else:
+        topo_el = html.Div("Topomap not available", style={"color": MUTED})
+
+    # Probability bar chart
+    comp_data = table_data[row_idx]
+    cls_names = ["brain", "muscle artifact", "eye blink", "heart beat", "line noise", "channel noise", "other"]
+    prob_vals = [float(comp_data.get(c, 0)) for c in cls_names]
+    prob_fig = go.Figure(data=[
+        go.Bar(x=cls_names, y=prob_vals, marker_color=["#3a8c5c" if c == "brain" else "#d44b2f" if v >= 0.5 else "#7b655d" for c, v in zip(cls_names, prob_vals)])
+    ])
+    prob_fig.update_layout(
+        template="plotly_white", height=250,
+        title=f"IC{comp_idx:03d}: {comp_data.get('label', '?')}",
+        yaxis_title="Probability", yaxis_range=[0, 1],
+        margin={"l": 40, "r": 20, "t": 40, "b": 60},
+        paper_bgcolor=PANEL,
+    )
+
+    # Activation time series
+    act_data = generate_activation_data(record_id, scope, comp_idx)
+    if act_data is not None:
+        times, activation = act_data
+        act_fig = go.Figure(data=[
+            go.Scatter(x=times, y=activation, mode="lines", line={"width": 1, "color": "#3a6b8c"})
+        ])
+        act_fig.update_layout(
+            template="plotly_white", height=200,
+            title=f"IC{comp_idx:03d} Activation",
+            xaxis_title="Time (s)",
+            margin={"l": 40, "r": 20, "t": 40, "b": 40},
+            paper_bgcolor=PANEL,
+        )
+    else:
+        act_fig = empty_fig
+
+    # PSD image
+    psd_b64 = generate_component_psd_base64(record_id, scope, comp_idx)
+    if psd_b64:
+        psd_el = html.Img(src=f"data:image/png;base64,{psd_b64}", style={"maxWidth": "100%", "borderRadius": "8px"})
+    else:
+        psd_el = html.Div("PSD not available", style={"color": MUTED})
+
+    return topo_el, prob_fig, act_fig, psd_el
 
 
 if __name__ == "__main__":

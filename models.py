@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
+import mne
 import numpy as np
+
+
+ICAScope = Literal["event", "session"]
 
 
 @dataclass(frozen=True)
@@ -107,3 +111,44 @@ class FeatureBlock:
     channel_names: list[str]
     label_info: LabelInfo
     source_note: str = ""
+
+
+@dataclass(frozen=True)
+class ICAEventWindow:
+    event: int
+    start_sec: float
+    stop_sec: float
+    epoch_index: int | None = None
+    label_summary: str = ""
+
+
+@dataclass
+class ICASourceBlock:
+    inst: mne.io.BaseRaw | mne.BaseEpochs
+    scope: ICAScope
+    fs: float
+    duration_sec: float
+    channel_names: list[str]
+    event_windows: list[ICAEventWindow]
+    label_info: LabelInfo
+    source_note: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ICAComponentInfo:
+    index: int
+    label: str
+    probabilities: dict[str, float]
+    suggested_reject: bool = False
+
+
+@dataclass
+class ICAResultBlock:
+    scope: ICAScope
+    fit_fs: float
+    components: list[ICAComponentInfo]
+    excluded_indices: list[int]
+    source_preview: SignalBlock
+    cleaned_preview: SignalBlock
+    notes: list[str] = field(default_factory=list)
